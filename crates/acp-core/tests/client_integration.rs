@@ -24,6 +24,7 @@ fn mock_adapter(env: HashMap<String, String>) -> AdapterConfig {
         system_prompt: None,
         disallowed_tools: vec![],
         socket_path: None,
+        mcp_command: None,
     }
 }
 

@@ -17,6 +17,10 @@ pub struct MessagesView {
     pub filter: Option<String>,
     /// Live streaming previews: (agent_name, partial_content)
     pub streaming: Vec<(String, String)>,
+    /// Auto-scroll to bottom on new messages (disabled when user scrolls up)
+    auto_scroll: bool,
+    /// Last known visible height (updated during render)
+    visible_height: u16,
 }
 
 #[derive(Clone)]
@@ -39,6 +43,8 @@ impl MessagesView {
             total_rendered_lines: 0,
             filter: None,
             streaming: Vec::new(),
+            auto_scroll: true,
+            visible_height: 40,
         }
     }
 
@@ -71,22 +77,27 @@ impl MessagesView {
 
     pub fn scroll_down(&mut self, n: u16) {
         self.scroll_offset = self.scroll_offset.saturating_add(n);
+        // Re-enable auto-scroll if we're at or near the bottom
+        let max_offset = self.total_rendered_lines.saturating_sub(self.visible_height);
+        if self.scroll_offset >= max_offset {
+            self.auto_scroll = true;
+        }
     }
 
     pub fn scroll_up(&mut self, n: u16) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
+        self.auto_scroll = false;
     }
 
-    pub fn scroll_to_bottom(&mut self, visible_height: u16) {
-        if self.total_rendered_lines > visible_height {
-            self.scroll_offset = self.total_rendered_lines - visible_height;
-        } else {
-            self.scroll_offset = 0;
-        }
+    pub fn scroll_to_bottom(&mut self, _visible_height: u16) {
+        // Now handled in render() after total_rendered_lines is updated.
+        // This method is kept for API compatibility but is a no-op.
+        // auto_scroll flag controls the behavior in render().
     }
 
     pub fn scroll_to_top(&mut self) {
         self.scroll_offset = 0;
+        self.auto_scroll = false;
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
@@ -97,8 +108,14 @@ impl MessagesView {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        self.visible_height = inner.height;
         let text = self.build_text(inner.width);
         self.total_rendered_lines = text.len() as u16;
+
+        // Auto-scroll to bottom when following new messages
+        if self.auto_scroll && self.total_rendered_lines > inner.height {
+            self.scroll_offset = self.total_rendered_lines - inner.height;
+        }
 
         let paragraph = Paragraph::new(text)
             .wrap(Wrap { trim: false })

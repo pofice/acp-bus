@@ -11,6 +11,7 @@ const DEFAULT_BYTE_LIMIT: u64 = 1024 * 1024;
 
 struct Terminal {
     child: Option<Child>,
+    pid: u32,
     output: Vec<u8>,
     output_bytes: u64,
     byte_limit: u64,
@@ -89,6 +90,7 @@ impl TerminalManager {
 
         let terminal = Terminal {
             child: Some(child),
+            pid,
             output: Vec::new(),
             output_bytes: 0,
             byte_limit,
@@ -219,12 +221,10 @@ impl TerminalManager {
     pub async fn handle_kill(&self, tid: &str) -> anyhow::Result<serde_json::Value> {
         let map = self.terminals.lock().await;
         if let Some(t) = map.get(tid) {
-            if let Some(ref child) = t.child {
-                if let Some(pid) = child.id() {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
-                    }
+            if t.pid != 0 && !t.exited {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(t.pid as i32, libc::SIGTERM);
                 }
             }
         }
@@ -234,12 +234,10 @@ impl TerminalManager {
     pub async fn handle_release(&self, tid: &str) -> anyhow::Result<serde_json::Value> {
         let mut map = self.terminals.lock().await;
         if let Some(t) = map.remove(tid) {
-            if let Some(ref child) = t.child {
-                if let Some(pid) = child.id() {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
-                    }
+            if t.pid != 0 && !t.exited {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(t.pid as i32, libc::SIGTERM);
                 }
             }
         }
@@ -249,12 +247,10 @@ impl TerminalManager {
     pub async fn cleanup(&self) {
         let mut map = self.terminals.lock().await;
         for (_, t) in map.drain() {
-            if let Some(ref child) = t.child {
-                if let Some(pid) = child.id() {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
-                    }
+            if t.pid != 0 && !t.exited {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(t.pid as i32, libc::SIGTERM);
                 }
             }
         }

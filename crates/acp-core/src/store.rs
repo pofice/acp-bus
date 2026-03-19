@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::channel::{Channel, Message, MessageKind, MessageStatus, MessageTransport};
 
@@ -38,8 +38,12 @@ pub struct SnapshotMessage {
 }
 
 /// Encode cwd for filesystem-safe directory name.
+/// Uses percent-encoding for `-` to avoid collisions (e.g. "/a/b" vs "/a-b").
 fn encode_cwd(cwd: &str) -> String {
-    cwd.trim_start_matches('/').replace('/', "-")
+    cwd.trim_start_matches('/')
+        .replace('%', "%25")
+        .replace('-', "%2D")
+        .replace('/', "-")
 }
 
 fn storage_dir(cwd: &str) -> PathBuf {
@@ -98,7 +102,10 @@ pub async fn save(channel: &Channel) -> anyhow::Result<PathBuf> {
     tokio::fs::create_dir_all(&dir).await?;
     let filepath = dir.join(format!("{}.json", channel.channel_id));
     let json = serde_json::to_string_pretty(&snapshot)?;
-    tokio::fs::write(&filepath, json).await?;
+    // Atomic write: write to temp file then rename to prevent corruption
+    let tmp = filepath.with_extension("json.tmp");
+    tokio::fs::write(&tmp, json).await?;
+    tokio::fs::rename(&tmp, &filepath).await?;
 
     info!(path = %filepath.display(), "snapshot saved");
     Ok(filepath)
@@ -117,8 +124,15 @@ pub async fn list_snapshots(cwd: &str) -> anyhow::Result<Vec<SnapshotInfo>> {
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         if path.extension().map(|e| e == "json").unwrap_or(false) {
-            if let Ok(data) = tokio::fs::read_to_string(&path).await {
-                if let Ok(snapshot) = serde_json::from_str::<Snapshot>(&data) {
+            let data = match tokio::fs::read_to_string(&path).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to read snapshot");
+                    continue;
+                }
+            };
+            match serde_json::from_str::<Snapshot>(&data) {
+                Ok(snapshot) => {
                     let agent_names: Vec<String> = snapshot
                         .agents
                         .iter()
@@ -131,6 +145,9 @@ pub async fn list_snapshots(cwd: &str) -> anyhow::Result<Vec<SnapshotInfo>> {
                         msg_count: snapshot.history.len(),
                         filepath: path,
                     });
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "corrupt snapshot, skipping");
                 }
             }
         }

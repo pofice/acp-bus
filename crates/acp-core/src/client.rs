@@ -135,7 +135,8 @@ impl AcpClient {
                     Ok(_) => {
                         let trimmed = line.trim();
                         if !trimmed.is_empty() {
-                            debug!(target: "acp_stderr", "{}", &trimmed[..trimmed.len().min(200)]);
+                            let truncated: String = trimmed.chars().take(200).collect();
+                            debug!(target: "acp_stderr", "{}", truncated);
                         }
                     }
                 }
@@ -274,10 +275,16 @@ impl AcpClient {
         };
 
         let mcp_servers = if let Some(ref sp) = client.adapter.socket_path {
+            let mcp_cmd = client.adapter.mcp_command.as_deref().unwrap_or("acp-bus-mcp");
+            let mcp_args = if mcp_cmd.ends_with("acp-bus") || mcp_cmd.ends_with("acp-bus.exe") {
+                serde_json::json!(["mcp-server"])
+            } else {
+                serde_json::json!([])
+            };
             serde_json::json!([{
                 "name": "acp-bus",
-                "command": "acp-bus-mcp",
-                "args": [],
+                "command": mcp_cmd,
+                "args": mcp_args,
                 "env": [
                     { "name": "ACP_BUS_SOCKET", "value": sp },
                     { "name": "ACP_BUS_AGENT_NAME", "value": &agent_name }
@@ -296,7 +303,7 @@ impl AcpClient {
             .request_with_retry(
                 "session/new",
                 serde_json::to_value(&session_params)?,
-                30_000,
+                60_000,
                 2,
             )
             .await?;

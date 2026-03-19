@@ -33,6 +33,8 @@ async fn append_comm_log(
     let _ = acp_core::comm_log::append(&cwd, &entry).await;
 }
 
+type SharedScheduler = Arc<Mutex<acp_core::scheduler::Scheduler>>;
+
 pub struct App {
     channel: Arc<Mutex<Channel>>,
     clients: ClientMap,
@@ -46,6 +48,8 @@ pub struct App {
     bus_tx: mpsc::UnboundedSender<BusEvent>,
     bus_rx: Option<mpsc::UnboundedReceiver<BusEvent>>,
     socket_path: Option<String>,
+    mcp_command: Option<String>,
+    scheduler: SharedScheduler,
 }
 
 impl App {
@@ -65,6 +69,10 @@ impl App {
             bus_tx,
             bus_rx: Some(bus_rx),
             socket_path: None,
+            mcp_command: std::env::current_exe()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string()),
+            scheduler: Arc::new(Mutex::new(acp_core::scheduler::Scheduler::new())),
         }
     }
 
@@ -251,7 +259,10 @@ impl App {
                 if result.delivered {
                     let channel = self.channel.clone();
                     let clients = self.clients.clone();
-                    tokio::spawn(do_prompt(to_agent, content, channel, clients));
+                    let sp = self.socket_path.clone();
+                    let mc = self.mcp_command.clone();
+                    let sc = self.scheduler.clone();
+                    tokio::spawn(do_prompt(to_agent, content, channel, clients, sp, mc, sc));
                 }
                 let _ = reply_tx.send(result);
             }
@@ -500,9 +511,12 @@ impl App {
             let content = target.content.clone();
             let channel = self.channel.clone();
             let clients = self.clients.clone();
+            let sp = self.socket_path.clone();
+            let mc = self.mcp_command.clone();
+            let sc = self.scheduler.clone();
 
             tokio::spawn(async move {
-                do_prompt(name.clone(), content.clone(), channel, clients).await;
+                do_prompt(name.clone(), content.clone(), channel, clients, sp, mc, sc).await;
             });
         }
     }
@@ -512,14 +526,17 @@ impl App {
         let content = content.to_string();
         let channel = self.channel.clone();
         let clients = self.clients.clone();
+        let sp = self.socket_path.clone();
+        let mc = self.mcp_command.clone();
+        let sc = self.scheduler.clone();
 
         tokio::spawn(async move {
-            do_prompt(name.clone(), content.clone(), channel, clients).await;
+            do_prompt(name.clone(), content.clone(), channel, clients, sp, mc, sc).await;
         });
     }
 
     async fn handle_command(&mut self, text: &str) {
-        let parts: Vec<&str> = text.splitn(3, ' ').collect();
+        let parts: Vec<&str> = text.splitn(4, ' ').collect();
         let cmd = parts[0];
 
         match cmd {
@@ -535,7 +552,29 @@ impl App {
                 }
                 let name = parts[1].to_string();
                 let adapter_name = parts[2].to_string();
-                self.start_agent(name, adapter_name).await;
+                let task = if parts.len() >= 4 {
+                    Some(parts[3].to_string())
+                } else {
+                    None
+                };
+                self.start_agent(name.clone(), adapter_name).await;
+
+                if let Some(task) = task {
+                    let ch = self.channel.clone();
+                    let cl = self.clients.clone();
+                    let sp = self.socket_path.clone();
+                    let mc = self.mcp_command.clone();
+                    let sc = self.scheduler.clone();
+                    tokio::spawn(async move {
+                        wait_for_agents(&[name.clone()], &cl, 30).await;
+                        {
+                            let mut chan = ch.lock().await;
+                            chan.post_directed("main", &name, &task,
+                                MessageKind::Task, MessageTransport::MentionRoute, MessageStatus::Delivered);
+                        }
+                        do_prompt(name, task, ch, cl, sp, mc, sc).await;
+                    });
+                }
             }
             "/remove" | "/rm" => {
                 if parts.len() < 2 {
@@ -560,14 +599,12 @@ impl App {
                 ch.remove_agent(&name);
             }
             "/list" | "/ls" => {
-                let ch = self.channel.lock().await;
+                let mut ch = self.channel.lock().await;
                 let agents = ch.list_agents();
                 let info: Vec<String> = agents
                     .iter()
                     .map(|a| format!("{} ({}) {}", a.name, a.kind, a.status))
                     .collect();
-                drop(ch);
-                let mut ch = self.channel.lock().await;
                 if info.is_empty() {
                     ch.post("系统", "无 agent", true);
                 } else {
@@ -590,16 +627,17 @@ impl App {
                     return;
                 }
                 let name = parts[1].to_string();
-                let map = self.clients.lock().await;
-                if let Some(client) = map.get(&name) {
+                let client = {
+                    let map = self.clients.lock().await;
+                    map.get(&name).cloned()
+                };
+                if let Some(client) = client {
                     let c = client.lock().await;
                     c.cancel().await;
                     drop(c);
-                    drop(map);
                     let mut ch = self.channel.lock().await;
                     ch.post("系统", &format!("已取消 {name}"), true);
                 } else {
-                    drop(map);
                     let mut ch = self.channel.lock().await;
                     ch.post("系统", &format!("{name} 不存在"), true);
                 }
@@ -649,6 +687,7 @@ impl App {
         let cwd = self.cwd.clone();
         let bus_tx = self.bus_tx.clone();
         let socket_path = self.socket_path.clone();
+        let mcp_command = self.mcp_command.clone();
 
         tokio::spawn(async move {
             let opts = AdapterOpts {
@@ -671,6 +710,7 @@ impl App {
                 }
             };
             config.socket_path = socket_path;
+            config.mcp_command = mcp_command;
 
             let system_prompt = config.system_prompt.clone();
 
@@ -817,8 +857,11 @@ fn do_prompt(
     content: String,
     channel: Arc<Mutex<Channel>>,
     clients: ClientMap,
+    socket_path: Option<String>,
+    mcp_command: Option<String>,
+    scheduler: SharedScheduler,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(do_prompt_inner(name, content, channel, clients))
+    Box::pin(do_prompt_inner(name, content, channel, clients, socket_path, mcp_command, scheduler))
 }
 
 async fn do_prompt_inner(
@@ -826,7 +869,28 @@ async fn do_prompt_inner(
     content: String,
     channel: Arc<Mutex<Channel>>,
     clients: ClientMap,
+    socket_path: Option<String>,
+    mcp_command: Option<String>,
+    scheduler: SharedScheduler,
 ) {
+    // Scheduler gate: serialize prompts to main agent
+    if name == "main" {
+        let should_send = {
+            let mut sched = scheduler.lock().await;
+            match sched.push_to_main(content.clone(), None) {
+                Ok(immediate) => immediate,
+                Err(msg) => {
+                    let mut ch = channel.lock().await;
+                    ch.post("系统", &msg, true);
+                    return;
+                }
+            }
+        };
+        if !should_send {
+            // Queued — will be dispatched when current main prompt finishes
+            return;
+        }
+    }
     // Build payload (system prompt is injected via ACP _meta at session creation)
     let payload = {
         let mut ch = channel.lock().await;
@@ -906,7 +970,7 @@ async fn do_prompt_inner(
         Ok(_) => {
             if !reply.is_empty() {
                 // Parse and execute /add commands from agent output
-                let added_agents = execute_agent_commands(&reply, &channel, &clients, None).await;
+                let added_agents = execute_agent_commands(&reply, &channel, &clients, None, socket_path.clone(), mcp_command.clone(), scheduler.clone()).await;
 
                 // Check if reply has @mentions that need routing
                 let known_agents = {
@@ -997,7 +1061,10 @@ async fn do_prompt_inner(
 
                         let ch = channel.clone();
                         let cl = clients.clone();
-                        tokio::spawn(do_prompt(tname, tcontent, ch, cl));
+                        let sp = socket_path.clone();
+                        let mc = mcp_command.clone();
+                        let sc = scheduler.clone();
+                        tokio::spawn(do_prompt(tname, tcontent, ch, cl, sp, mc, sc));
                     }
                 }
             } else {
@@ -1018,6 +1085,22 @@ async fn do_prompt_inner(
             ch.state_changed();
         }
     }
+
+    // Scheduler: if this was main, drain the next queued message
+    if name == "main" {
+        let next = {
+            let mut sched = scheduler.lock().await;
+            sched.main_done()
+        };
+        if let Some(queued) = next {
+            let ch = channel.clone();
+            let cl = clients.clone();
+            let sp = socket_path.clone();
+            let mc = mcp_command.clone();
+            let sc = scheduler.clone();
+            tokio::spawn(do_prompt("main".to_string(), queued.content, ch, cl, sp, mc, sc));
+        }
+    }
 }
 
 /// Scan agent output for `/add name adapter` commands and execute them.
@@ -1027,15 +1110,23 @@ async fn execute_agent_commands(
     channel: &Arc<Mutex<Channel>>,
     clients: &ClientMap,
     bus_tx: Option<mpsc::UnboundedSender<BusEvent>>,
+    socket_path: Option<String>,
+    mcp_command: Option<String>,
+    scheduler: SharedScheduler,
 ) -> Vec<String> {
     let mut added = Vec::new();
     for line in reply.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("/add ") {
-            let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
+            let parts: Vec<&str> = trimmed.splitn(4, ' ').collect();
             if parts.len() >= 3 {
                 let agent_name = parts[1].to_string();
                 let adapter_name = parts[2].to_string();
+                let task = if parts.len() >= 4 {
+                    Some(parts[3].to_string())
+                } else {
+                    None
+                };
                 let exists = {
                     let ch = channel.lock().await;
                     ch.agents.contains_key(&agent_name)
@@ -1047,9 +1138,28 @@ async fn execute_agent_commands(
                         channel.clone(),
                         clients.clone(),
                         bus_tx.clone(),
+                        socket_path.clone(),
+                        mcp_command.clone(),
                     )
                     .await;
-                    added.push(agent_name);
+                    added.push(agent_name.clone());
+
+                    if let Some(task) = task {
+                        let ch = channel.clone();
+                        let cl = clients.clone();
+                        let sp = socket_path.clone();
+                        let mc = mcp_command.clone();
+                        let sc = scheduler.clone();
+                        tokio::spawn(async move {
+                            wait_for_agents(&[agent_name.clone()], &cl, 30).await;
+                            {
+                                let mut chan = ch.lock().await;
+                                chan.post_directed("main", &agent_name, &task,
+                                    MessageKind::Task, MessageTransport::MentionRoute, MessageStatus::Delivered);
+                            }
+                            do_prompt(agent_name, task, ch, cl, sp, mc, sc).await;
+                        });
+                    }
                 }
             }
         } else if trimmed.starts_with("/remove ") {
@@ -1097,6 +1207,8 @@ async fn start_agent_bg(
     channel: Arc<Mutex<Channel>>,
     clients: ClientMap,
     bus_tx: Option<mpsc::UnboundedSender<BusEvent>>,
+    socket_path: Option<String>,
+    mcp_command: Option<String>,
 ) {
     let cwd = {
         let ch = channel.lock().await;
@@ -1115,7 +1227,7 @@ async fn start_agent_bg(
             cwd: Some(cwd.clone()),
         };
 
-        let config = match adapter::get(&adapter_name, &opts) {
+        let mut config = match adapter::get(&adapter_name, &opts) {
             Ok(c) => c,
             Err(e) => {
                 let mut ch = channel.lock().await;
@@ -1123,6 +1235,8 @@ async fn start_agent_bg(
                 return;
             }
         };
+        config.socket_path = socket_path;
+        config.mcp_command = mcp_command;
 
         let system_prompt = config.system_prompt.clone();
 

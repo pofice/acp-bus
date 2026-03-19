@@ -31,6 +31,55 @@ enum Commands {
         #[arg(long, default_value = ".")]
         cwd: String,
     },
+    /// Internal: run as MCP server for agent bus tools
+    #[command(name = "mcp-server")]
+    McpServer,
+}
+
+async fn mcp_call_socket(
+    socket_path: &str,
+    agent_name: &str,
+    tool: &str,
+    args: &serde_json::Value,
+) -> String {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    if socket_path.is_empty() {
+        return r#"{"error":"ACP_BUS_SOCKET not set"}"#.to_string();
+    }
+
+    let req = match tool {
+        "bus_send_message" => {
+            let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            serde_json::json!({ "type": "send_message", "from": agent_name, "to": to, "content": content })
+        }
+        "bus_list_agents" => {
+            serde_json::json!({ "type": "list_agents", "from": agent_name })
+        }
+        _ => return r#"{"error":"unknown tool"}"#.to_string(),
+    };
+
+    let stream = match UnixStream::connect(socket_path).await {
+        Ok(s) => s,
+        Err(e) => return format!(r#"{{"error":"connect failed: {e}"}}"#),
+    };
+
+    let (reader, mut writer) = stream.into_split();
+    let mut line = req.to_string();
+    line.push('\n');
+    if writer.write_all(line.as_bytes()).await.is_err() {
+        return r#"{"error":"write failed"}"#.to_string();
+    }
+    let _ = writer.shutdown().await;
+
+    let mut lines = BufReader::new(reader).lines();
+    match lines.next_line().await {
+        Ok(Some(resp)) => resp,
+        Ok(None) => r#"{"error":"no response"}"#.to_string(),
+        Err(e) => format!(r#"{{"error":"read failed: {e}"}}"#),
+    }
 }
 
 #[tokio::main]
@@ -77,6 +126,89 @@ async fn main() -> anyhow::Result<()> {
             }
             let cwd = std::fs::canonicalize(&cwd)?.to_string_lossy().to_string();
             acp_server::serve_stdio(cwd).await?;
+        }
+        Commands::McpServer => {
+            use std::io::Write;
+            use serde_json::json;
+            use tokio::io::{AsyncBufReadExt, BufReader};
+
+            let socket_path = std::env::var("ACP_BUS_SOCKET").unwrap_or_default();
+            let agent_name =
+                std::env::var("ACP_BUS_AGENT_NAME").unwrap_or_else(|_| "unknown".into());
+
+            let stdin = tokio::io::stdin();
+            let mut lines = BufReader::new(stdin).lines();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                let msg: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                let id = msg.get("id").cloned();
+                let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+
+                let result = match method {
+                    "initialize" => json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "acp-bus-mcp", "version": "0.1.0" }
+                    }),
+                    "notifications/initialized" => continue,
+                    "tools/list" => json!({
+                        "tools": [
+                            {
+                                "name": "bus_send_message",
+                                "description": "Send a message to another agent in the acp-bus channel",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "to": { "type": "string", "description": "Target agent name" },
+                                        "content": { "type": "string", "description": "Message content" }
+                                    },
+                                    "required": ["to", "content"]
+                                }
+                            },
+                            {
+                                "name": "bus_list_agents",
+                                "description": "List all agents in the acp-bus channel with their status",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {}
+                                }
+                            }
+                        ]
+                    }),
+                    "tools/call" => {
+                        let params = msg.get("params").cloned().unwrap_or(json!({}));
+                        let tool_name =
+                            params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+                        let resp =
+                            mcp_call_socket(&socket_path, &agent_name, tool_name, &args).await;
+                        json!({ "content": [{ "type": "text", "text": resp }] })
+                    }
+                    _ => {
+                        let resp = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32601, "message": format!("method not found: {method}") }
+                        });
+                        let mut stdout = std::io::stdout().lock();
+                        let _ = serde_json::to_writer(&mut stdout, &resp);
+                        let _ = stdout.write_all(b"\n");
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+
+                let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                let mut stdout = std::io::stdout().lock();
+                let _ = serde_json::to_writer(&mut stdout, &resp);
+                let _ = stdout.write_all(b"\n");
+                let _ = stdout.flush();
+            }
         }
         Commands::Channels { cwd } => {
             let cwd = std::fs::canonicalize(&cwd)?.to_string_lossy().to_string();
