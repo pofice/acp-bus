@@ -48,6 +48,8 @@ pub struct AgentInfo {
     pub name: String,
     pub status: String,
     pub adapter: String,
+    pub activity: Option<String>,
+    pub active_secs: Option<i64>,
 }
 
 /// Shared activity tracker — updated on every session/update event
@@ -740,7 +742,13 @@ async fn handle_reverse_request(
                 match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
                     Ok(Ok(agents)) => {
                         let list: Vec<serde_json::Value> = agents.iter().map(|a| {
-                            serde_json::json!({"name": a.name, "status": a.status, "adapter": a.adapter})
+                            serde_json::json!({
+                                "name": a.name,
+                                "status": a.status,
+                                "adapter": a.adapter,
+                                "activity": a.activity,
+                                "activeSecs": a.active_secs,
+                            })
                         }).collect();
                         encode_response(id, serde_json::json!({"agents": list}))
                     }

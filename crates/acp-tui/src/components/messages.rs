@@ -96,6 +96,10 @@ impl MessagesView {
         // auto_scroll flag controls the behavior in render().
     }
 
+    pub fn snap_to_bottom(&mut self) {
+        self.auto_scroll = true;
+    }
+
     pub fn scroll_to_top(&mut self) {
         self.scroll_offset = 0;
         self.auto_scroll = false;

@@ -125,6 +125,25 @@ impl InputBox {
         self.text.is_empty()
     }
 
+    /// Number of visual lines considering wrap at `width`.
+    /// `width` is the text area width (excluding prompt).
+    pub fn visual_line_count(&self, width: u16) -> u16 {
+        if width == 0 {
+            return 1;
+        }
+        let w = width as usize;
+        let mut lines: u16 = 0;
+        for logical_line in self.text.split('\n') {
+            let line_w = logical_line.width();
+            if line_w == 0 {
+                lines += 1;
+            } else {
+                lines += ((line_w + w - 1) / w) as u16; // ceil division
+            }
+        }
+        lines.max(1)
+    }
+
     pub fn dismiss_popup(&mut self) {
         self.popup_visible = false;
         self.candidates.clear();
@@ -232,6 +251,57 @@ impl InputBox {
         self.cursor_pos = new_cursor;
     }
 
+    /// Split text into visual rows with soft wrapping at `wrap_w` display columns.
+    /// Returns Vec of (row_text, byte_start) for each visual row.
+    fn wrap_lines(&self, wrap_w: usize) -> Vec<(String, usize)> {
+        let mut rows: Vec<(String, usize)> = Vec::new();
+        if wrap_w == 0 {
+            rows.push((self.text.clone(), 0));
+            return rows;
+        }
+        let mut byte_offset: usize = 0;
+        for logical_line in self.text.split('\n') {
+            if logical_line.is_empty() {
+                rows.push((String::new(), byte_offset));
+            } else {
+                let mut row = String::new();
+                let mut col: usize = 0;
+                let mut row_start = byte_offset;
+                for ch in logical_line.chars() {
+                    let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if col + cw > wrap_w && !row.is_empty() {
+                        rows.push((std::mem::take(&mut row), row_start));
+                        col = 0;
+                        row_start = byte_offset;
+                    }
+                    row.push(ch);
+                    col += cw;
+                    byte_offset += ch.len_utf8();
+                }
+                if !row.is_empty() {
+                    rows.push((row, row_start));
+                }
+            }
+            byte_offset += 1; // '\n'
+        }
+        if rows.is_empty() {
+            rows.push((String::new(), 0));
+        }
+        rows
+    }
+
+    /// Visual (row, col) of cursor considering soft wrap.
+    fn cursor_visual_pos(&self, wrap_w: usize) -> (u16, u16) {
+        let rows = self.wrap_lines(wrap_w);
+        for (i, (_, byte_start)) in rows.iter().enumerate().rev() {
+            if self.cursor_pos >= *byte_start {
+                let col = self.text[*byte_start..self.cursor_pos].width();
+                return (i as u16, col as u16);
+            }
+        }
+        (0, 0)
+    }
+
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::TOP)
@@ -239,10 +309,20 @@ impl InputBox {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let prompt = Span::styled("> ", Style::default().fg(Color::DarkGray));
-        let text = Span::raw(self.text.as_str());
-        let line = Line::from(vec![prompt, text]);
-        buf.set_line(inner.x, inner.y, &line, inner.width);
+        let prompt = "> ";
+        let prompt_w = prompt.width() as u16;
+        let text_w = inner.width.saturating_sub(prompt_w) as usize;
+        let rows = self.wrap_lines(text_w);
+
+        for (i, (row_text, _)) in rows.iter().enumerate() {
+            let y = inner.y + i as u16;
+            if y >= inner.y + inner.height {
+                break;
+            }
+            let prefix = if i == 0 { "> " } else { "  " };
+            buf.set_string(inner.x, y, prefix, Style::default().fg(Color::DarkGray));
+            buf.set_string(inner.x + prompt_w, y, row_text, Style::default());
+        }
     }
 
     /// Render the completion popup above the input area
@@ -296,10 +376,12 @@ impl InputBox {
     }
 
     pub fn cursor_position(&self, area: Rect) -> (u16, u16) {
-        // +2 for "> " prompt, +1 for top border, use display width for CJK
-        let display_width = self.text[..self.cursor_pos].width() as u16;
-        let x = area.x + 2 + display_width;
-        let y = area.y + 1; // below the top border
+        let prompt_w: u16 = 2; // "> "
+        let inner_y = area.y + 1; // below top border
+        let text_w = area.width.saturating_sub(prompt_w + 1) as usize; // -1 for border
+        let (row, col) = self.cursor_visual_pos(text_w);
+        let x = area.x + prompt_w + col;
+        let y = inner_y + row;
         (x, y)
     }
 }

@@ -282,19 +282,23 @@ impl App {
                     let sp = self.socket_path.clone();
                     let mc = self.mcp_command.clone();
                     let sc = self.scheduler.clone();
-                    tokio::spawn(do_prompt(to_agent, content, channel, clients, sp, mc, sc));
+                    let sender = from_agent.clone();
+                    tokio::spawn(do_prompt_with_reply(to_agent, content, channel, clients, sp, mc, sc, sender));
                 }
                 let _ = reply_tx.send(result);
             }
             BusEvent::ListAgents { reply_tx, .. } => {
                 let agents = {
                     let ch = self.channel.lock().await;
+                    let now = chrono::Utc::now().timestamp();
                     ch.agents
                         .iter()
                         .map(|(name, agent)| acp_core::client::AgentInfo {
                             name: name.clone(),
                             status: agent.status.to_string(),
                             adapter: agent.adapter_name.clone(),
+                            activity: agent.activity.clone(),
+                            active_secs: agent.prompt_start_time.map(|t| (now - t).max(0)),
                         })
                         .collect()
                 };
@@ -355,7 +359,11 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let layout = AppLayout::new(frame.area());
+        // Compute text area width for input wrapping: total - sidebar - prompt - borders
+        let area = frame.area();
+        let sidebar_w: u16 = if area.width > 100 { 24 } else if area.width > 60 { 20 } else { 16 };
+        let input_text_w = area.width.saturating_sub(sidebar_w + 3); // 2 for prompt + 1 for border
+        let layout = AppLayout::new(area, self.input.visual_line_count(input_text_w));
 
         // Sidebar (agent list)
         self.status_bar
@@ -392,6 +400,9 @@ impl App {
             }
             (_, KeyCode::Esc) => {
                 self.input.dismiss_popup();
+            }
+            (KeyModifiers::CONTROL, KeyCode::Enter) => {
+                self.input.insert('\n');
             }
             (_, KeyCode::Enter) => {
                 self.input.dismiss_popup();
@@ -456,7 +467,7 @@ impl App {
                 self.messages.filter = Some(name.clone());
             }
         }
-        self.messages.scroll_to_top();
+        self.messages.snap_to_bottom();
     }
 
     async fn cancel_selected_agent(&self) {
@@ -931,7 +942,20 @@ fn do_prompt(
     mcp_command: Option<String>,
     scheduler: SharedScheduler,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(do_prompt_inner(name, content, channel, clients, socket_path, mcp_command, scheduler))
+    Box::pin(do_prompt_inner(name, content, channel, clients, socket_path, mcp_command, scheduler, None))
+}
+
+fn do_prompt_with_reply(
+    name: String,
+    content: String,
+    channel: Arc<Mutex<Channel>>,
+    clients: ClientMap,
+    socket_path: Option<String>,
+    mcp_command: Option<String>,
+    scheduler: SharedScheduler,
+    reply_to: String,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(do_prompt_inner(name, content, channel, clients, socket_path, mcp_command, scheduler, Some(reply_to)))
 }
 
 async fn do_prompt_inner(
@@ -942,6 +966,7 @@ async fn do_prompt_inner(
     socket_path: Option<String>,
     mcp_command: Option<String>,
     scheduler: SharedScheduler,
+    reply_to: Option<String>,
 ) {
     // Scheduler gate: serialize prompts to main agent
     if name == "main" {
@@ -1050,9 +1075,42 @@ async fn do_prompt_inner(
                 let targets = router::route(&reply, &name, &known_agents, 1);
 
                 if targets.is_empty() {
-                    // No routing — post full reply as broadcast
-                    let mut ch = channel.lock().await;
-                    ch.post(&name, &reply, true);
+                    if let Some(ref sender) = reply_to {
+                        // Auto-route reply back to the agent who sent the bus message
+                        {
+                            let mut ch = channel.lock().await;
+                            let (conversation_id, reply_ref) =
+                                ch.resolve_reply_context(&name, sender);
+                            ch.post_directed_with_refs(
+                                &name,
+                                sender,
+                                &reply,
+                                MessageKind::Chat,
+                                MessageTransport::BusTool,
+                                MessageStatus::Delivered,
+                                conversation_id,
+                                reply_ref,
+                            );
+                            if let Some(conv_id) = conversation_id {
+                                ch.post_audit(&format!(
+                                    "auto-reply #{conv_id}: {name} -> {sender}"
+                                ));
+                            }
+                        }
+                        // Prompt the sender with the reply
+                        let ch = channel.clone();
+                        let cl = clients.clone();
+                        let sp = socket_path.clone();
+                        let mc = mcp_command.clone();
+                        let sc = scheduler.clone();
+                        let sender = sender.clone();
+                        let reply_content = format!("[来自 {name} 的回复]\n{reply}");
+                        tokio::spawn(do_prompt(sender, reply_content, ch, cl, sp, mc, sc));
+                    } else {
+                        // No routing, no reply_to — post full reply as broadcast
+                        let mut ch = channel.lock().await;
+                        ch.post(&name, &reply, true);
+                    }
                 } else {
                     // Has @mentions — skip broadcast to avoid duplicate messages.
                     // Only post directed messages to each target below.

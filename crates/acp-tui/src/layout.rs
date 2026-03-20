@@ -7,7 +7,7 @@ pub struct AppLayout {
 }
 
 impl AppLayout {
-    pub fn new(area: Rect) -> Self {
+    pub fn new(area: Rect, input_lines: u16) -> Self {
         // Sidebar width: wider for tool call tree display
         let sidebar_width = if area.width > 100 {
             24
@@ -25,12 +25,16 @@ impl AppLayout {
             ])
             .split(area);
 
+        // Input height: 1 border + text lines, capped at 1/3 of screen
+        let max_input = (h_chunks[1].height / 3).max(2);
+        let input_height = (input_lines + 1).clamp(2, max_input); // +1 for top border
+
         // Chat area: messages + input
         let v_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(5),    // messages
-                Constraint::Length(3), // input (with border)
+                Constraint::Min(5),                    // messages
+                Constraint::Length(input_height),       // input
             ])
             .split(h_chunks[1]);
 
