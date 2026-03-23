@@ -12,8 +12,6 @@ use acp_core::channel::{Channel, ChannelEvent, MessageKind, MessageStatus, Messa
 use acp_core::client::{AcpClient, BusEvent, BusSendResult, ClientEvent};
 use acp_core::router;
 
-use acp_protocol::session::PromptContent;
-
 use crate::components::input::InputBox;
 use crate::components::messages::MessagesView;
 use crate::components::status_bar::{AgentDisplay, StatusBar, ToolCallDisplay};
@@ -1111,27 +1109,34 @@ async fn do_prompt_inner(
     // Dispatch messages are posted by the caller (handle_input or do_prompt_inner routing).
     // No need to post again here.
 
+    // If image is attached, save to file and prepend path to prompt text
+    let final_payload = if let Some(img) = image {
+        // Save image to temp file in cwd so agent can read it
+        let ext = if img.media_type.contains("png") { "png" } else { "jpg" };
+        let ts = chrono::Utc::now().timestamp_millis();
+        let filename = format!(".acp-paste-{ts}.{ext}");
+        let cwd = {
+            let ch = channel.lock().await;
+            ch.cwd.clone()
+        };
+        let filepath = std::path::Path::new(&cwd).join(&filename);
+        if let Ok(raw) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &img.base64) {
+            let _ = tokio::fs::write(&filepath, &raw).await;
+        }
+        let abs_path = filepath.to_string_lossy();
+        if payload.is_empty() {
+            format!("[用户粘贴了一张图片，请用 Read 工具查看: {abs_path}]")
+        } else {
+            format!("[用户粘贴了一张图片: {abs_path}]\n{payload}")
+        }
+    } else {
+        payload.clone()
+    };
+
     // Execute prompt
     let stop_reason = {
         let c = client.lock().await;
-        if let Some(img) = image {
-            // Build mixed content: image + text
-            let mut prompt_parts = vec![PromptContent::Image {
-                source: acp_protocol::session::ImageSource {
-                    source_type: "base64".to_string(),
-                    media_type: img.media_type,
-                    data: img.base64,
-                },
-            }];
-            if !payload.is_empty() {
-                prompt_parts.push(PromptContent::Text {
-                    text: payload.clone(),
-                });
-            }
-            c.prompt_content(prompt_parts).await
-        } else {
-            c.prompt(&payload).await
-        }
+        c.prompt(&final_payload).await
     };
 
     // Collect reply from stream_buf
