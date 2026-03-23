@@ -18,6 +18,13 @@ use crate::components::status_bar::{AgentDisplay, StatusBar, ToolCallDisplay};
 
 use crate::layout::AppLayout;
 
+/// Image data from clipboard, ready to send with next prompt.
+#[derive(Debug, Clone)]
+struct PendingImage {
+    base64: String,
+    media_type: String,
+}
+
 type ClientHandle = Arc<tokio::sync::Mutex<AcpClient>>;
 type ClientMap = Arc<Mutex<HashMap<String, ClientHandle>>>;
 
@@ -50,6 +57,7 @@ pub struct App {
     socket_path: Option<String>,
     mcp_command: Option<String>,
     scheduler: SharedScheduler,
+    pending_image: Option<PendingImage>,
 }
 
 impl App {
@@ -73,6 +81,7 @@ impl App {
                 .ok()
                 .map(|p| p.to_string_lossy().to_string()),
             scheduler: Arc::new(Mutex::new(acp_core::scheduler::Scheduler::new())),
+            pending_image: None,
         }
     }
 
@@ -406,15 +415,20 @@ impl App {
             }
             (_, KeyCode::Enter) => {
                 self.input.dismiss_popup();
-                if !self.input.is_empty() {
+                let has_image = self.pending_image.is_some();
+                if !self.input.is_empty() || has_image {
                     let text = self.input.take();
-                    self.handle_input(text).await;
+                    let image = self.pending_image.take();
+                    self.handle_input(text, image).await;
                 }
             }
             (_, KeyCode::Backspace) => self.input.backspace(),
             (_, KeyCode::Delete) => self.input.delete(),
             (_, KeyCode::Home) => self.input.move_home(),
             (_, KeyCode::End) => self.input.move_end(),
+            (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
+                self.try_paste_image().await;
+            }
             (KeyModifiers::CONTROL, KeyCode::Char('j')) => self.messages.scroll_down(1),
             (KeyModifiers::CONTROL, KeyCode::Char('k')) => self.messages.scroll_up(1),
             (KeyModifiers::CONTROL, KeyCode::Char('d')) => self.messages.scroll_down(10),
@@ -436,6 +450,47 @@ impl App {
             (_, KeyCode::Right) => self.input.move_right(),
             (_, KeyCode::Char(c)) => self.input.insert(c),
             _ => {}
+        }
+    }
+
+    /// Try to read image from system clipboard and store as pending.
+    async fn try_paste_image(&mut self) {
+        // arboard clipboard access is blocking — run in spawn_blocking
+        let result = tokio::task::spawn_blocking(|| -> Option<PendingImage> {
+            let mut clipboard = arboard::Clipboard::new().ok()?;
+            let img = clipboard.get_image().ok()?;
+            // Encode RGBA data as PNG
+            let mut png_buf = std::io::Cursor::new(Vec::new());
+            let encoder = image::codecs::png::PngEncoder::new(&mut png_buf);
+            image::ImageEncoder::write_image(
+                encoder,
+                &img.bytes,
+                img.width as u32,
+                img.height as u32,
+                image::ExtendedColorType::Rgba8,
+            )
+            .ok()?;
+            let b64 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                png_buf.into_inner(),
+            );
+            Some(PendingImage {
+                base64: b64,
+                media_type: "image/png".to_string(),
+            })
+        })
+        .await;
+
+        match result {
+            Ok(Some(img)) => {
+                self.pending_image = Some(img);
+                let mut ch = self.channel.lock().await;
+                ch.post("系统", "📎 已从剪贴板读取图片，输入文字后回车发送（或直接回车仅发图片）", true);
+            }
+            _ => {
+                // No image in clipboard — fall back to text paste via bracketed paste
+                // (crossterm handles this automatically)
+            }
         }
     }
 
@@ -503,11 +558,22 @@ impl App {
         }
     }
 
-    async fn handle_input(&mut self, text: String) {
+    async fn handle_input(&mut self, text: String, image: Option<PendingImage>) {
         if text.starts_with('/') {
             self.handle_command(&text).await;
             return;
         }
+
+        // Build display text for channel messages
+        let display_text = if image.is_some() {
+            if text.is_empty() {
+                "[图片]".to_string()
+            } else {
+                format!("[图片] {text}")
+            }
+        } else {
+            text.clone()
+        };
 
         // Determine target agent
         let has_mention = text.contains('@');
@@ -518,7 +584,7 @@ impl App {
                 let route_info = ch.post_message(
                     "you",
                     None,
-                    &text,
+                    &display_text,
                     MessageKind::Task,
                     MessageTransport::Ui,
                     MessageStatus::Sent,
@@ -530,7 +596,7 @@ impl App {
                 entry.transport = Some("ui".to_string());
                 entry.status = Some("sent".to_string());
                 entry.message_id = ch.messages.last().map(|m| m.id);
-                entry.content = Some(text.clone());
+                entry.content = Some(display_text.clone());
                 entry.detail = Some("user broadcast with mentions".to_string());
                 let cwd = ch.cwd.clone();
                 let channel_id = ch.channel_id.clone();
@@ -540,7 +606,7 @@ impl App {
                 route_info
             };
             if let Some((content, from)) = route_info {
-                self.dispatch_to_agents(&content, &from).await;
+                self.dispatch_to_agents(&content, &from, image).await;
             }
         } else {
             // Direct message to selected agent (like a normal chat)
@@ -553,7 +619,7 @@ impl App {
                 let message_id = ch.post_directed(
                     "you",
                     &target,
-                    &text,
+                    &display_text,
                     MessageKind::Chat,
                     MessageTransport::Ui,
                     MessageStatus::Delivered,
@@ -564,22 +630,22 @@ impl App {
                 entry.transport = Some("ui".to_string());
                 entry.status = Some("delivered".to_string());
                 entry.message_id = Some(message_id);
-                entry.content = Some(text.clone());
+                entry.content = Some(display_text.clone());
                 entry.detail = Some("user direct chat".to_string());
                 let _ = acp_core::comm_log::append(&ch.cwd, &entry).await;
             }
-            self.dispatch_single_agent(&target, &text).await;
+            self.dispatch_single_agent(&target, &text, image).await;
         }
     }
 
-    async fn dispatch_to_agents(&self, content: &str, from: &str) {
+    async fn dispatch_to_agents(&self, content: &str, from: &str, image: Option<PendingImage>) {
         let targets = {
             let ch = self.channel.lock().await;
             let names: Vec<String> = ch.agents.keys().cloned().collect();
             router::route(content, from, &names, 0)
         };
 
-        for target in targets {
+        for (i, target) in targets.iter().enumerate() {
             let name = target.name.clone();
             // When message is from user, prepend context so agent knows to reply directly
             let content = if from == "you" || from == "你" {
@@ -592,14 +658,16 @@ impl App {
             let sp = self.socket_path.clone();
             let mc = self.mcp_command.clone();
             let sc = self.scheduler.clone();
+            // Only pass image to the first target to avoid duplicating large payloads
+            let img = if i == 0 { image.clone() } else { None };
 
             tokio::spawn(async move {
-                do_prompt(name.clone(), content.clone(), channel, clients, sp, mc, sc).await;
+                do_prompt(name.clone(), content.clone(), channel, clients, sp, mc, sc, img).await;
             });
         }
     }
 
-    async fn dispatch_single_agent(&self, name: &str, content: &str) {
+    async fn dispatch_single_agent(&self, name: &str, content: &str, image: Option<PendingImage>) {
         let name = name.to_string();
         let content = content.to_string();
         let channel = self.channel.clone();
@@ -609,7 +677,7 @@ impl App {
         let sc = self.scheduler.clone();
 
         tokio::spawn(async move {
-            do_prompt(name.clone(), content.clone(), channel, clients, sp, mc, sc).await;
+            do_prompt(name.clone(), content.clone(), channel, clients, sp, mc, sc, image).await;
         });
     }
 
@@ -650,7 +718,7 @@ impl App {
                             chan.post_directed("main", &name, &task,
                                 MessageKind::Task, MessageTransport::MentionRoute, MessageStatus::Delivered);
                         }
-                        do_prompt(name, task, ch, cl, sp, mc, sc).await;
+                        do_prompt(name, task, ch, cl, sp, mc, sc, None).await;
                     });
                 }
             }
@@ -941,8 +1009,9 @@ fn do_prompt(
     socket_path: Option<String>,
     mcp_command: Option<String>,
     scheduler: SharedScheduler,
+    image: Option<PendingImage>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(do_prompt_inner(name, content, channel, clients, socket_path, mcp_command, scheduler, None))
+    Box::pin(do_prompt_inner(name, content, channel, clients, socket_path, mcp_command, scheduler, None, image))
 }
 
 fn do_prompt_with_reply(
@@ -955,7 +1024,7 @@ fn do_prompt_with_reply(
     scheduler: SharedScheduler,
     reply_to: String,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(do_prompt_inner(name, content, channel, clients, socket_path, mcp_command, scheduler, Some(reply_to)))
+    Box::pin(do_prompt_inner(name, content, channel, clients, socket_path, mcp_command, scheduler, Some(reply_to), None))
 }
 
 async fn do_prompt_inner(
@@ -967,6 +1036,7 @@ async fn do_prompt_inner(
     mcp_command: Option<String>,
     scheduler: SharedScheduler,
     reply_to: Option<String>,
+    image: Option<PendingImage>,
 ) {
     // Scheduler gate: serialize prompts to main agent
     if name == "main" {
@@ -1039,10 +1109,34 @@ async fn do_prompt_inner(
     // Dispatch messages are posted by the caller (handle_input or do_prompt_inner routing).
     // No need to post again here.
 
+    // If image is attached, save to file and prepend path to prompt text
+    let final_payload = if let Some(img) = image {
+        // Save image to temp file in cwd so agent can read it
+        let ext = if img.media_type.contains("png") { "png" } else { "jpg" };
+        let ts = chrono::Utc::now().timestamp_millis();
+        let filename = format!(".acp-paste-{ts}.{ext}");
+        let cwd = {
+            let ch = channel.lock().await;
+            ch.cwd.clone()
+        };
+        let filepath = std::path::Path::new(&cwd).join(&filename);
+        if let Ok(raw) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &img.base64) {
+            let _ = tokio::fs::write(&filepath, &raw).await;
+        }
+        let abs_path = filepath.to_string_lossy();
+        if payload.is_empty() {
+            format!("[用户粘贴了一张图片，请用 Read 工具查看: {abs_path}]")
+        } else {
+            format!("[用户粘贴了一张图片: {abs_path}]\n{payload}")
+        }
+    } else {
+        payload.clone()
+    };
+
     // Execute prompt
     let stop_reason = {
         let c = client.lock().await;
-        c.prompt(&payload).await
+        c.prompt(&final_payload).await
     };
 
     // Collect reply from stream_buf
@@ -1105,7 +1199,7 @@ async fn do_prompt_inner(
                         let sc = scheduler.clone();
                         let sender = sender.clone();
                         let reply_content = format!("[来自 {name} 的回复]\n{reply}");
-                        tokio::spawn(do_prompt(sender, reply_content, ch, cl, sp, mc, sc));
+                        tokio::spawn(do_prompt(sender, reply_content, ch, cl, sp, mc, sc, None));
                     } else {
                         // No routing, no reply_to — post full reply as broadcast
                         let mut ch = channel.lock().await;
@@ -1180,7 +1274,7 @@ async fn do_prompt_inner(
                         let sp = socket_path.clone();
                         let mc = mcp_command.clone();
                         let sc = scheduler.clone();
-                        tokio::spawn(do_prompt(tname, tcontent, ch, cl, sp, mc, sc));
+                        tokio::spawn(do_prompt(tname, tcontent, ch, cl, sp, mc, sc, None));
                     }
                 }
             } else {
@@ -1214,7 +1308,7 @@ async fn do_prompt_inner(
             let sp = socket_path.clone();
             let mc = mcp_command.clone();
             let sc = scheduler.clone();
-            tokio::spawn(do_prompt("main".to_string(), queued.content, ch, cl, sp, mc, sc));
+            tokio::spawn(do_prompt("main".to_string(), queued.content, ch, cl, sp, mc, sc, None));
         }
     }
 }
@@ -1304,7 +1398,7 @@ async fn execute_agent_commands(
                                 chan.post_directed("main", &agent_name, &task,
                                     MessageKind::Task, MessageTransport::MentionRoute, MessageStatus::Delivered);
                             }
-                            do_prompt(agent_name, task, ch, cl, sp, mc, sc).await;
+                            do_prompt(agent_name, task, ch, cl, sp, mc, sc, None).await;
                         });
                     }
                 }

@@ -360,6 +360,14 @@ impl AcpClient {
 
     /// Send a prompt to the agent (async, returns stop_reason).
     pub async fn prompt(&self, text: &str) -> anyhow::Result<String> {
+        self.prompt_content(vec![PromptContent::Text {
+            text: text.to_string(),
+        }])
+        .await
+    }
+
+    /// Send a multi-content prompt (text + images) to the agent.
+    pub async fn prompt_content(&self, prompt: Vec<PromptContent>) -> anyhow::Result<String> {
         let session_id = self
             .session_id
             .as_ref()
@@ -367,9 +375,7 @@ impl AcpClient {
 
         let params = SessionPromptParams {
             session_id: session_id.clone(),
-            prompt: vec![PromptContent::Text {
-                text: text.to_string(),
-            }],
+            prompt,
         };
 
         let result = self
