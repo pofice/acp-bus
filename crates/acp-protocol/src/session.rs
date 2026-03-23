@@ -16,10 +16,17 @@ pub enum PromptContent {
         text: String,
     },
     Image {
-        data: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        media_type: Option<String>,
+        source: ImageSource,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageSource {
+    /// Always "base64" for inline images.
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub media_type: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

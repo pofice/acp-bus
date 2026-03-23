@@ -1117,8 +1117,11 @@ async fn do_prompt_inner(
         if let Some(img) = image {
             // Build mixed content: image + text
             let mut prompt_parts = vec![PromptContent::Image {
-                data: img.base64,
-                media_type: Some(img.media_type),
+                source: acp_protocol::session::ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: img.media_type,
+                    data: img.base64,
+                },
             }];
             if !payload.is_empty() {
                 prompt_parts.push(PromptContent::Text {
